@@ -33,14 +33,18 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
             return preflight
         index_status = IndexFreshnessService(config).status(allow_auto_start=False)
         confidence_cap = "medium" if index_status.get("state") == "usable_stale" else None
-        return attach_index_status(config, retriever.search(args["query"], args.get("repo_area"), args.get("doc_type"), bool(args.get("include_historical", False)), int(args.get("max_results", 8)), bool(args.get("rerank", True)), verbosity=str(args.get("verbosity", "compact")), mode="documents", confidence_cap=confidence_cap), index_status)
+        result = retriever.search(args["query"], args.get("repo_area"), args.get("doc_type"), bool(args.get("include_historical", False)), int(args.get("max_results", 8)), bool(args.get("rerank", True)), verbosity=str(args.get("verbosity", "compact")), mode="documents", confidence_cap=confidence_cap)
+        index_status = maybe_start_after_search(config, index_status)
+        return attach_index_status(config, result, index_status)
     if name == "locate_topic":
         preflight = preflight_search(config, str(args["query"]))
         if preflight:
             return preflight
         index_status = IndexFreshnessService(config).status(allow_auto_start=False)
         confidence_cap = "medium" if index_status.get("state") == "usable_stale" else None
-        return attach_index_status(config, retriever.search(args["query"], args.get("repo_area"), None, bool(args.get("include_historical", False)), int(args.get("max_sections", 8)), bool(args.get("rerank", True)), dedupe_documents=False, verbosity=str(args.get("verbosity", "compact")), mode="sections", confidence_cap=confidence_cap), index_status)
+        result = retriever.search(args["query"], args.get("repo_area"), None, bool(args.get("include_historical", False)), int(args.get("max_sections", 8)), bool(args.get("rerank", True)), dedupe_documents=False, verbosity=str(args.get("verbosity", "compact")), mode="sections", confidence_cap=confidence_cap)
+        index_status = maybe_start_after_search(config, index_status)
+        return attach_index_status(config, result, index_status)
     if name == "open_doc":
         return retriever.open_doc(args["path"], args.get("heading"), args.get("line_start"), args.get("line_end"), int(args.get("max_chars", 12000)))
     if name == "search_exact":
@@ -80,9 +84,11 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
 
 
 def preflight_search(config: LocatorConfig, query: str) -> dict[str, Any] | None:
-    index_status = IndexFreshnessService(config).status(allow_auto_start=True)
+    service = IndexFreshnessService(config)
+    index_status = service.status(allow_auto_start=False)
     if index_status.get("state") != "blocked":
         return None
+    index_status = service.status(allow_auto_start=True)
     return {
         "query": query,
         "intent": "locate_doc",
@@ -95,6 +101,12 @@ def preflight_search(config: LocatorConfig, query: str) -> dict[str, Any] | None
         "owner_action": owner_action(index_status),
         "index_status": compact_index_status(index_status),
     }
+
+
+def maybe_start_after_search(config: LocatorConfig, index_status: dict[str, Any]) -> dict[str, Any]:
+    if index_status.get("state") != "usable_stale":
+        return index_status
+    return IndexFreshnessService(config).status(allow_auto_start=True)
 
 
 def owner_action(index_status: dict[str, Any]) -> str:

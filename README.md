@@ -37,6 +37,7 @@ Agents often waste tokens and time reading random files or running broad text se
 - Glossary/entity retrieval for definitions and naming/domain-model queries.
 - Background indexing hints with explicit `owner_action` when blocked.
 - SQLite catalog is committed before Qdrant rebuild, so explicit path/symbol lookup can work while vectors are still building.
+- Existing Qdrant collections are updated in place during rebuild; they are not dropped first, so the previous semantic index remains queryable until fresh points replace it.
 - Compact JSON output with scores rounded to `0.000..1.000`.
 - Windows-friendly scripts plus normal Python entrypoints.
 
@@ -147,6 +148,7 @@ Add this short policy to the target agent instructions:
 - If `search_mode=blocked`, follow `owner_action`.
 - Use `search_exact` only for explicit symbol/path/config-key lookups.
 - If `index_status.exact_available=true`, exact lookup is allowed only for those explicit terms; otherwise retry `find_docs` / `locate_topic` after `retry_after_seconds`.
+- If the index is `usable_stale`, the MCP should still answer from the previous index, cap confidence at medium, and refresh in the background after the current search.
 
 ## Project Config
 
@@ -188,7 +190,7 @@ Common blockers:
 
 When MCP search is blocked, the response includes `owner_action`. Agents should not invent fallback behavior.
 
-During indexing, `find_docs` and `locate_topic` can remain blocked until Qdrant document and section collections are complete. The SQLite catalog is committed first; if `index_status.exact_available=true`, `search_exact` may resolve explicit paths, symbols, route IDs, or config keys while semantic retrieval finishes.
+During first indexing, `find_docs` and `locate_topic` can remain blocked until Qdrant document and section collections are complete. After a usable index exists, stale indexes should stay queryable: the MCP answers from the previous index, caps confidence at medium, and updates Qdrant in place in the background. The SQLite catalog is committed first; if `index_status.exact_available=true`, `search_exact` may resolve explicit paths, symbols, route IDs, or config keys while semantic retrieval finishes.
 
 ## Security Model
 

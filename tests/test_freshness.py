@@ -3,9 +3,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from workspace_docs_mcp.config import load_config
 from workspace_docs_mcp.freshness import IndexFreshnessService
+from workspace_docs_mcp.mcp_server import preflight_search
 from workspace_docs_mcp.search import score
 
 
@@ -41,6 +43,16 @@ class IndexFreshnessTests(unittest.TestCase):
 
             self.assertEqual(result["state"], "skipped")
             self.assertEqual(result["reason"], "too_many_changed_files")
+
+    def test_preflight_does_not_start_background_for_usable_stale(self) -> None:
+        config = load_config(Path.cwd())
+        stale = {"state": "usable_stale", "safe_to_use": True, "warnings": ["index_stale"], "background_index": {"state": "idle"}}
+
+        with patch("workspace_docs_mcp.mcp_server.IndexFreshnessService.status", return_value=stale) as status:
+            result = preflight_search(config, "architecture overview")
+
+        self.assertIsNone(result)
+        status.assert_called_once_with(allow_auto_start=False)
 
 
 if __name__ == "__main__":

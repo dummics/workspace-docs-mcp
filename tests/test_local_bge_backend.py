@@ -36,6 +36,12 @@ class LocalBgeBackendContractTests(unittest.TestCase):
 
         self.assertNotIn("load_reranker", source)
 
+    def test_vector_rebuild_does_not_recreate_existing_collections(self) -> None:
+        source = inspect.getsource(VectorIndex.rebuild_from_sqlite)
+
+        self.assertNotIn("recreate_collection", source)
+        self.assertIn("ensure_collection", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,15 +39,12 @@ class VectorIndex:
         vector_config = {self.DENSE_VECTOR: models.VectorParams(size=1024, distance=models.Distance.COSINE)}
         sparse_config = {self.SPARSE_VECTOR: models.SparseVectorParams()}
         for collection in [docs_collection, chunks_collection]:
-            client.recreate_collection(
-                collection_name=collection,
-                vectors_config=vector_config,
-                sparse_vectors_config=sparse_config,
-            )
+            self.ensure_collection(client, models, collection, vector_config, sparse_config)
 
         docs = conn.execute("SELECT * FROM documents").fetchall()
         doc_texts = [self.document_card_text(row) for row in docs]
         doc_encoded = backend.encode_passages(doc_texts, return_sparse=True) if doc_texts else {"dense": [], "sparse": []}
+        expected_doc_ids = {str(uuid.uuid5(uuid.NAMESPACE_URL, row["path"])) for row in docs}
         if docs:
             client.upsert(
                 collection_name=docs_collection,
@@ -60,8 +57,10 @@ class VectorIndex:
                     for index, (row, text) in enumerate(zip(docs, doc_texts))
                 ],
             )
+        self.delete_stale_points(client, models, docs_collection, expected_doc_ids)
 
         rows = conn.execute("SELECT * FROM chunks").fetchall()
+        expected_chunk_ids = {str(uuid.uuid5(uuid.NAMESPACE_URL, row["chunk_id"])) for row in rows}
         batch_size = 16
         upserted = 0
         for offset in range(0, len(rows), batch_size):
@@ -80,6 +79,7 @@ class VectorIndex:
                 ],
             )
             upserted += len(batch)
+        self.delete_stale_points(client, models, chunks_collection, expected_chunk_ids)
         return {
             "enabled": True,
             "documents": len(docs),
@@ -91,6 +91,41 @@ class VectorIndex:
             "reranker_model": self.config.reranker_model,
             "reranker_backend": self.config.reranker_backend,
         }
+
+    def ensure_collection(self, client: Any, models: Any, collection: str, vector_config: dict[str, Any], sparse_config: dict[str, Any]) -> None:
+        try:
+            client.get_collection(collection_name=collection)
+            return
+        except Exception:
+            client.create_collection(
+                collection_name=collection,
+                vectors_config=vector_config,
+                sparse_vectors_config=sparse_config,
+            )
+
+    def delete_stale_points(self, client: Any, models: Any, collection: str, expected_ids: set[str]) -> None:
+        stale: list[str] = []
+        offset = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=collection,
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for point in points:
+                point_id = str(point.id)
+                if point_id not in expected_ids:
+                    stale.append(point_id)
+            if offset is None:
+                break
+        if stale:
+            client.delete(
+                collection_name=collection,
+                points_selector=models.PointIdsList(points=stale),
+                wait=True,
+            )
 
     def point_vectors(self, dense: list[float], sparse_weights: dict[int, float] | dict[str, float] | None) -> dict[str, Any]:
         sparse = lexical_weights_to_qdrant_sparse(sparse_weights)
