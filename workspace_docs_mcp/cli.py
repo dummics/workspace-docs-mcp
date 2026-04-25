@@ -170,6 +170,12 @@ models:
   require_embedding_dimension: 1024
   require_reranker: true
   use_fp16: auto
+
+auto_index:
+  enabled: true
+  debounce_seconds: 600
+  retry_after_seconds: 15
+  max_changed_files: 20
 """
     write_if_missing(workspace_dir / "locator.config.yml", config_yml)
     write_if_missing(workspace_dir / "topic-aliases.json", '{\n  "aliases": []\n}\n')

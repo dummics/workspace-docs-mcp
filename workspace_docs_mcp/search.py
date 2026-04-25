@@ -542,8 +542,44 @@ class Retriever:
         self.catalog.init()
         status_clause, params = self.allowed_status_clause(include_historical)
         results: list[dict[str, Any]] = []
-        q = f"%{term}%"
+        term_text = term.strip()
+        term_lower = term_text.lower().replace("\\", "/").lstrip("/")
+        q = f"%{term_text}%"
+        seen: set[tuple[str, int, str]] = set()
+
+        def add_result(item: dict[str, Any]) -> None:
+            key = (str(item.get("path")), int(item.get("line_number") or 1), str(item.get("source_kind")))
+            if key in seen or len(results) >= max_results:
+                return
+            seen.add(key)
+            results.append(item)
+
         with self.catalog.connect() as conn:
+            doc_rows = conn.execute(
+                f"""
+                SELECT d.path,d.title,d.status,d.repo_area,d.doc_type,d.authority,
+                       COALESCE(MIN(c.line_start), 1) AS line_number
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id=d.document_id
+                WHERE (lower(d.path)=? OR lower(d.path) LIKE ? OR lower(d.title)=? OR lower(d.title) LIKE ?) AND {status_clause.replace('status', 'd.status')}
+                GROUP BY d.path
+                ORDER BY d.authority DESC, d.path
+                LIMIT ?
+                """,
+                [term_lower, f"%{term_lower}%", term_lower, f"%{term_lower}%", *params, max_results],
+            ).fetchall()
+            for row in doc_rows:
+                if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
+                    continue
+                add_result(
+                    {
+                        "path": row["path"],
+                        "line_number": row["line_number"],
+                        "snippet": row["title"],
+                        "source_kind": "catalog_path" if term_lower in str(row["path"]).lower() else "catalog_title",
+                        "related_canonical_docs": [row["path"]] if row["status"] in {"canonical", "runbook"} else [],
+                    }
+                )
             rows = conn.execute(
                 f"SELECT path,line_start AS line_number,text AS snippet,'markdown' source_kind,title,status FROM chunks WHERE (text LIKE ? OR title LIKE ? OR path LIKE ?) AND {status_clause} LIMIT ?",
                 [q, q, q, *params, max_results],
@@ -553,15 +589,34 @@ class Retriever:
                     doc = conn.execute("SELECT repo_area FROM documents WHERE path=?", (row["path"],)).fetchone()
                     if doc and doc["repo_area"] != repo_area:
                         continue
-                results.append({"path": row["path"], "line_number": row["line_number"], "snippet": snippet(row["snippet"], term), "source_kind": row["source_kind"], "related_canonical_docs": []})
+                add_result({"path": row["path"], "line_number": row["line_number"], "snippet": snippet(row["snippet"], term), "source_kind": row["source_kind"], "related_canonical_docs": []})
             remaining = max_results - len(results)
             if remaining > 0:
-                sym_rows = conn.execute("SELECT * FROM symbols WHERE symbol LIKE ? LIMIT ?", (q, remaining)).fetchall()
+                sym_rows = conn.execute("SELECT * FROM symbols WHERE lower(symbol)=? OR symbol LIKE ? LIMIT ?", (term_text.lower(), q, remaining)).fetchall()
                 for row in sym_rows:
                     if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
                         continue
-                    results.append({"path": row["path"], "line_number": row["line_number"], "snippet": row["symbol"], "source_kind": row["source_kind"], "related_canonical_docs": []})
-        conf = "high" if results and any(term.lower() in r["snippet"].lower() for r in results[:3]) else "medium" if results else "low"
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": row["symbol"], "source_kind": row["source_kind"], "related_canonical_docs": []})
+            remaining = max_results - len(results)
+            if remaining > 0:
+                entity_rows = conn.execute(
+                    """
+                    SELECT e.source_path AS path,e.line_start AS line_number,e.term,e.definition,'glossary' AS source_kind
+                    FROM entities e
+                    LEFT JOIN entity_aliases a ON a.entity_id=e.entity_id
+                    WHERE lower(e.term)=? OR lower(a.alias)=? OR e.definition LIKE ?
+                    ORDER BY e.authority DESC LIMIT ?
+                    """,
+                    (term_text.lower(), term_text.lower(), q, remaining),
+                ).fetchall()
+                for row in entity_rows:
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": snippet(f"{row['term']}: {row['definition']}", term), "source_kind": row["source_kind"], "related_canonical_docs": []})
+            remaining = max_results - len(results)
+            if remaining > 0:
+                route_rows = conn.execute("SELECT target_path AS path,topic,route_name,'route' AS source_kind FROM routes WHERE lower(topic)=? OR topic LIKE ? OR target_path LIKE ? ORDER BY priority LIMIT ?", (term_text.lower(), q, q, remaining)).fetchall()
+                for row in route_rows:
+                    add_result({"path": row["path"], "line_number": 1, "snippet": row["topic"], "source_kind": row["source_kind"], "related_canonical_docs": [row["path"]]})
+        conf = "high" if results and any(r["source_kind"] in {"catalog_path", "catalog_title"} or term.lower() in str(r["snippet"]).lower() for r in results[:3]) else "medium" if results else "low"
         return {"term": term, "confidence": conf, "results": results[:max_results]}
 
     def open_doc(self, path: str, heading: str | None = None, line_start: int | None = None, line_end: int | None = None, max_chars: int = 12000) -> dict[str, Any]:

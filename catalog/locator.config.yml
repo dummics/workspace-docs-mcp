@@ -107,6 +107,7 @@ confidence:
 auto_index:
   enabled: true
   debounce_seconds: 600
+  retry_after_seconds: 15
   max_changed_files: 20
   lock_path: .rag/index.lock
   last_start_path: .rag/index-worker-last-start.json

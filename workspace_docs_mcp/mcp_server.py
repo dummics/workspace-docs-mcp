@@ -66,6 +66,7 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
             "index_status": compact_index_status(index_status),
             "qdrant_available": qdrant_ok,
             "qdrant_warning": qdrant_warning,
+            "owner_action": owner_action(index_status) if index_status.get("state") == "blocked" else None,
             "embedding_model": config.embedding_model,
             "embedding_backend": config.embedding_backend,
             "embedding_dim": config.data["models"].get("require_embedding_dimension"),
@@ -99,7 +100,15 @@ def preflight_search(config: LocatorConfig, query: str) -> dict[str, Any] | None
 def owner_action(index_status: dict[str, Any]) -> str:
     background = index_status.get("background_index") or {}
     if background.get("state") in {"started", "running"}:
-        return "Wait for background indexing to complete, then retry find_docs or locate_topic."
+        detail = []
+        if background.get("pid"):
+            detail.append(f"pid={background['pid']}")
+        if background.get("elapsed_seconds") is not None:
+            detail.append(f"elapsed={background['elapsed_seconds']}s")
+        if background.get("log_path"):
+            detail.append(f"log={background['log_path']}")
+        suffix = f" ({', '.join(detail)})" if detail else ""
+        return f"Background indexing is running; retry the same find_docs/locate_topic query after retry_after_seconds.{suffix}"
     if "qdrant_unavailable" in index_status.get("reasons", []):
         return "Start Qdrant at the configured URL, then run workspace-docs index build."
     return "Run workspace-docs index build or fix the reported model/index blocker. No fallback model is allowed."
@@ -152,6 +161,10 @@ def compact_index_status(status: dict[str, Any]) -> dict[str, Any]:
             "state": (status.get("background_index") or {}).get("state"),
             "reason": (status.get("background_index") or {}).get("reason"),
             "pid": (status.get("background_index") or {}).get("pid"),
+            "started_at": (status.get("background_index") or {}).get("started_at"),
+            "elapsed_seconds": (status.get("background_index") or {}).get("elapsed_seconds"),
+            "retry_after_seconds": (status.get("background_index") or {}).get("retry_after_seconds"),
+            "log_path": (status.get("background_index") or {}).get("log_path"),
         },
     }
 

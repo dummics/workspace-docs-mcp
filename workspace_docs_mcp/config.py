@@ -79,6 +79,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_index": {
         "enabled": True,
         "debounce_seconds": 600,
+        "retry_after_seconds": 15,
         "max_changed_files": 20,
         "lock_path": ".rag/index.lock",
         "last_start_path": ".rag/index-worker-last-start.json",

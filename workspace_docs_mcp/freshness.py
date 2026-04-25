@@ -172,6 +172,12 @@ class IndexFreshnessService:
                 state["lock"] = json.loads(self.lock_path.read_text(encoding="utf-8"))
             except Exception:
                 state["lock"] = {"raw": self.lock_path.read_text(encoding="utf-8", errors="ignore")}
+            started_at = state.get("lock", {}).get("started_at") if isinstance(state.get("lock"), dict) else None
+            started = parse_time(started_at)
+            if started:
+                state["started_at"] = started.isoformat()
+                state["elapsed_seconds"] = max(0, int((utc_now() - started).total_seconds()))
+            state["retry_after_seconds"] = int(self.config.data.get("auto_index", {}).get("retry_after_seconds", 15))
         if self.last_start_path.exists():
             try:
                 state["last_start"] = json.loads(self.last_start_path.read_text(encoding="utf-8"))
@@ -243,7 +249,7 @@ class IndexFreshnessService:
             payload["pid"] = process.pid
             self.lock_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             self.last_start_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            return {"state": "started", "pid": process.pid, "log_path": str(self.log_path), "reason": index_state}
+            return {"state": "started", "pid": process.pid, "log_path": str(self.log_path), "reason": index_state, "started_at": started, "elapsed_seconds": 0, "retry_after_seconds": int(self.config.data.get("auto_index", {}).get("retry_after_seconds", 15))}
         except Exception as exc:
             try:
                 self.lock_path.unlink(missing_ok=True)

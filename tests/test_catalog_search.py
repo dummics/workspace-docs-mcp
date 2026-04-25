@@ -56,6 +56,19 @@ class CatalogSearchTests(unittest.TestCase):
             historical_paths = [r["path"] for r in exact_with_history["results"]]
             self.assertIn("docs/archive/old.md", historical_paths)
 
+    def test_exact_search_finds_catalog_path_and_lowercase_config_key(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            self.build_basic_catalog(root)
+            config = load_config(root)
+            path_result = Retriever(config).exact("docs/server/canonical.md")
+            config_key_result = Retriever(config).exact("LicenseActivationHandler")
+
+            self.assertEqual(path_result["confidence"], "high")
+            self.assertEqual(path_result["results"][0]["path"], "docs/server/canonical.md")
+            self.assertEqual(path_result["results"][0]["source_kind"], "catalog_path")
+            self.assertTrue(any(item["path"] == "docs/server/canonical.md" for item in config_key_result["results"]))
+
     def test_open_blocks_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
@@ -150,6 +163,24 @@ class CatalogSearchTests(unittest.TestCase):
             self.assertEqual(result["confidence"], "low")
             self.assertEqual(result["results"], [])
             self.assertIn("owner_action", result)
+
+    def test_blocked_index_running_reports_retry_and_log(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            self.build_basic_catalog(root)
+            blocked = {
+                "state": "blocked",
+                "safe_to_use": False,
+                "warnings": ["background_index_running"],
+                "reasons": ["workspace_docs_changed"],
+                "background_index": {"state": "running", "pid": 123, "elapsed_seconds": 7, "retry_after_seconds": 15, "log_path": "x.log"},
+            }
+            with patch("workspace_docs_mcp.mcp_server.IndexFreshnessService.status", return_value=blocked):
+                result = call_tool(load_config(root), "find_docs", {"query": "server activation"})
+
+            self.assertIn("retry_after_seconds", result["owner_action"])
+            self.assertEqual(result["index_status"]["background_index"]["retry_after_seconds"], 15)
+            self.assertEqual(result["index_status"]["background_index"]["log_path"], "x.log")
 
     def test_usable_stale_caps_confidence_at_medium(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
