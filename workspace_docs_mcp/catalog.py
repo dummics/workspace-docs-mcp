@@ -11,6 +11,7 @@ from .config import LocatorConfig
 from .entities import parse_entities
 from .markdown import discover_markdown, git_commit, load_manifest_context, parse_document, rel_path
 from .model import Chunk, Document
+from .source_index import discover_source_files, extract_code_symbols, extract_config_keys, read_text, redact_line, source_file_for
 from .vector import VectorIndex
 
 
@@ -92,6 +93,39 @@ CREATE TABLE IF NOT EXISTS symbols (
   repo_area TEXT,
   source_kind TEXT
 );
+CREATE TABLE IF NOT EXISTS source_files (
+  path TEXT PRIMARY KEY,
+  source_repo TEXT,
+  repo_area TEXT,
+  extension TEXT,
+  source_kind TEXT,
+  size_bytes INTEGER,
+  content_hash TEXT,
+  last_modified TEXT,
+  indexed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS code_symbols (
+  symbol TEXT,
+  symbol_type TEXT,
+  path TEXT,
+  line_number INTEGER,
+  repo_area TEXT,
+  source_repo TEXT,
+  source_kind TEXT,
+  container TEXT,
+  signature TEXT,
+  context TEXT
+);
+CREATE TABLE IF NOT EXISTS config_keys (
+  key TEXT,
+  key_type TEXT,
+  path TEXT,
+  line_number INTEGER,
+  repo_area TEXT,
+  source_repo TEXT,
+  source_kind TEXT,
+  context TEXT
+);
 CREATE TABLE IF NOT EXISTS entities (
   entity_id TEXT PRIMARY KEY,
   term TEXT NOT NULL,
@@ -126,6 +160,7 @@ CREATE TABLE IF NOT EXISTS index_runs (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, path UNINDEXED, title, heading, text, text_for_embedding);
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id UNINDEXED, term, aliases, definition, source_path UNINDEXED);
+CREATE VIRTUAL TABLE IF NOT EXISTS source_lines_fts USING fts5(path UNINDEXED, line_number UNINDEXED, text, source_kind UNINDEXED, repo_area UNINDEXED, source_repo UNINDEXED);
 """
 
 
@@ -140,7 +175,10 @@ class Catalog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
+        return self.connect_to(self.path)
+
+    def connect_to(self, path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -168,6 +206,7 @@ class Catalog:
         docs: list[Document] = []
         chunks: list[Chunk] = []
         links: list[dict[str, Any]] = []
+        previous_index_runs = self.index_runs_snapshot()
         for path in discover_markdown(self.config):
             try:
                 doc, doc_chunks, doc_links = parse_document(path, self.config, nav_paths, generated_status, commit)
@@ -177,8 +216,12 @@ class Catalog:
                 warnings.extend(f"{doc.path}: {w}" for w in doc.warnings)
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
-        with self.connect() as conn:
-            conn.executescript("DELETE FROM documents; DELETE FROM chunks; DELETE FROM links; DELETE FROM aliases; DELETE FROM routes; DELETE FROM symbols; DELETE FROM entities; DELETE FROM entity_aliases; DELETE FROM chunks_fts; DELETE FROM entities_fts;")
+        temp_path = self.path.with_name(f"{self.path.stem}.{run_id}.build.sqlite")
+        self.remove_sqlite_files(temp_path)
+        with self.connect_to(temp_path) as conn:
+            conn.executescript(SCHEMA)
+            conn.executescript("DELETE FROM documents; DELETE FROM chunks; DELETE FROM links; DELETE FROM aliases; DELETE FROM routes; DELETE FROM symbols; DELETE FROM source_files; DELETE FROM code_symbols; DELETE FROM config_keys; DELETE FROM entities; DELETE FROM entity_aliases; DELETE FROM chunks_fts; DELETE FROM entities_fts; DELETE FROM source_lines_fts;")
+            self.restore_index_runs(conn, previous_index_runs)
             for doc in docs:
                 self.upsert_document(conn, doc)
             for chunk in chunks:
@@ -191,7 +234,13 @@ class Catalog:
             self.load_manual_aliases(conn)
             self.load_routes(conn)
             self.load_entities(conn)
-            self.extract_symbols(conn)
+            self.index_source_files(conn)
+
+        # Build the catalog in a side database first. If parsing/indexing is interrupted,
+        # the previously usable catalog remains untouched.
+        with self.connect_to(temp_path) as source, self.connect() as target:
+            source.backup(target)
+        self.remove_sqlite_files(temp_path)
 
         # Commit the deterministic SQLite catalog before the heavier vector rebuild.
         # This keeps exact/path lookups usable while Qdrant is still being populated.
@@ -218,6 +267,41 @@ class Catalog:
                 ),
             )
         return {"docs": len(docs), "chunks": len(chunks), "warnings": warnings, "errors": errors, "sqlite": str(self.path), "qdrant": vector_result}
+
+    def index_runs_snapshot(self) -> list[dict[str, Any]]:
+        try:
+            with self.connect() as conn:
+                return [dict(row) for row in conn.execute("SELECT * FROM index_runs ORDER BY completed_at")]
+        except Exception:
+            return []
+
+    def restore_index_runs(self, conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            conn.execute(
+                "INSERT OR REPLACE INTO index_runs(run_id,started_at,completed_at,git_commit,embedding_model,embedding_backend,reranker_model,reranker_backend,chunker_version,docs_count,chunks_count,errors_json,warnings_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.get("run_id"),
+                    row.get("started_at"),
+                    row.get("completed_at"),
+                    row.get("git_commit"),
+                    row.get("embedding_model"),
+                    row.get("embedding_backend"),
+                    row.get("reranker_model"),
+                    row.get("reranker_backend"),
+                    row.get("chunker_version"),
+                    row.get("docs_count"),
+                    row.get("chunks_count"),
+                    row.get("errors_json"),
+                    row.get("warnings_json"),
+                ),
+            )
+
+    def remove_sqlite_files(self, path: Path) -> None:
+        for candidate in [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]:
+            try:
+                candidate.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def update(self) -> dict[str, Any]:
         # MVP keeps update deterministic by rebuilding. The hash schema is already present for a future delta pass.
@@ -373,29 +457,45 @@ class Catalog:
                 (entity_id, entity.term, " ".join(aliases), entity.definition, entity.source_path),
             )
 
-    def extract_symbols(self, conn: sqlite3.Connection) -> None:
-        patterns = [
-            (re.compile(r"\b(class|record|interface|enum)\s+([A-Z][A-Za-z0-9_]+)"), "type"),
-            (re.compile(r"\b([A-Z][A-Z0-9_]{3,})\b"), "constant"),
-            (re.compile(r"\$\{([A-Z0-9_]{3,})(?::[^}]*)?\}"), "config_key"),
-        ]
-        roots = self.config.code_roots() + self.config.manifest_files()
-        for root in roots:
-            files = [root] if root.is_file() else list(root.rglob("*")) if root.exists() else []
-            for path in files:
-                if path.suffix.lower() not in {".cs", ".json", ".ps1", ".md", ".ts", ".tsx"}:
-                    continue
-                try:
-                    rel = rel_path(self.config.root, path)
-                    rel_lower = rel.lower()
-                    area = "server" if rel_lower.startswith("server/") or "/server/" in rel_lower or "/backend/" in rel_lower else "client" if rel_lower.startswith("client/") or "/client/" in rel_lower or "/frontend/" in rel_lower else "framework"
-                    for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
-                        for regex, sym_type in patterns:
-                            for match in regex.finditer(line):
-                                symbol = match.group(2) if sym_type == "type" else match.group(1)
-                                conn.execute("INSERT INTO symbols(symbol,symbol_type,path,line_number,repo_area,source_kind) VALUES(?,?,?,?,?,?)", (symbol, sym_type, rel, line_no, area, "code" if path.suffix.lower() == ".cs" else "manifest"))
-                except Exception:
-                    continue
+    def index_source_files(self, conn: sqlite3.Connection) -> None:
+        line_max_bytes = int(self.config.data.get("paths", {}).get("source_line_index_max_bytes", 262144))
+        ts = now()
+        for path in discover_source_files(self.config):
+            try:
+                source = source_file_for(self.config, path)
+                conn.execute(
+                    "INSERT INTO source_files(path,source_repo,repo_area,extension,source_kind,size_bytes,content_hash,last_modified,indexed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (source.path, source.source_repo, source.repo_area, source.extension, source.source_kind, source.size_bytes, source.content_hash, source.last_modified, ts),
+                )
+                text = read_text(path)
+                lines = text.splitlines()
+                if source.size_bytes <= line_max_bytes:
+                    for line_no, line in enumerate(lines, start=1):
+                        if line.strip():
+                            conn.execute(
+                                "INSERT INTO source_lines_fts(path,line_number,text,source_kind,repo_area,source_repo) VALUES(?,?,?,?,?,?)",
+                                (source.path, line_no, redact_line(line)[:2000], source.source_kind, source.repo_area, source.source_repo),
+                            )
+                for symbol in extract_code_symbols(source, lines):
+                    conn.execute(
+                        "INSERT INTO code_symbols(symbol,symbol_type,path,line_number,repo_area,source_repo,source_kind,container,signature,context) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (symbol.symbol, symbol.symbol_type, symbol.path, symbol.line_number, symbol.repo_area, symbol.source_repo, symbol.source_kind, symbol.container, symbol.signature, symbol.context),
+                    )
+                    conn.execute(
+                        "INSERT INTO symbols(symbol,symbol_type,path,line_number,repo_area,source_kind) VALUES(?,?,?,?,?,?)",
+                        (symbol.symbol, symbol.symbol_type, symbol.path, symbol.line_number, symbol.repo_area, symbol.source_kind),
+                    )
+                for key in extract_config_keys(source, lines):
+                    conn.execute(
+                        "INSERT INTO config_keys(key,key_type,path,line_number,repo_area,source_repo,source_kind,context) VALUES(?,?,?,?,?,?,?,?)",
+                        (key.key, key.key_type, key.path, key.line_number, key.repo_area, key.source_repo, key.source_kind, key.context),
+                    )
+                    conn.execute(
+                        "INSERT INTO symbols(symbol,symbol_type,path,line_number,repo_area,source_kind) VALUES(?,?,?,?,?,?)",
+                        (key.key, key.key_type, key.path, key.line_number, key.repo_area, key.source_kind),
+                    )
+            except Exception:
+                continue
 
     def stats(self) -> dict[str, Any]:
         self.init()
@@ -407,6 +507,9 @@ class Catalog:
                 "chunks": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
                 "links": conn.execute("SELECT COUNT(*) FROM links").fetchone()[0],
                 "symbols": conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0],
+                "source_files": conn.execute("SELECT COUNT(*) FROM source_files").fetchone()[0],
+                "code_symbols": conn.execute("SELECT COUNT(*) FROM code_symbols").fetchone()[0],
+                "config_keys": conn.execute("SELECT COUNT(*) FROM config_keys").fetchone()[0],
                 "entities": conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
                 "by_status": [dict(r) for r in conn.execute("SELECT status, COUNT(*) count FROM documents GROUP BY status ORDER BY count DESC")],
                 "last_run": dict(last_run) if last_run else None,

@@ -151,6 +151,9 @@ def compact_catalog_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "documents": stats.get("documents", 0),
         "chunks": stats.get("chunks", 0),
         "symbols": stats.get("symbols", 0),
+        "source_files": stats.get("source_files", 0),
+        "code_symbols": stats.get("code_symbols", 0),
+        "config_keys": stats.get("config_keys", 0),
         "last_run": {
             "completed_at": last_run.get("completed_at"),
             "git_commit": last_run.get("git_commit"),

@@ -35,6 +35,8 @@ Agents often waste tokens and time reading random files or running broad text se
 - Document-first search for `find_docs`.
 - Section-first search for `locate_topic`.
 - Glossary/entity retrieval for definitions and naming/domain-model queries.
+- Workspace file inventory plus lightweight code/config exact index.
+- Code symbols and config keys can bridge queries back to authoritative docs without embedding full source files.
 - Background indexing hints with explicit `owner_action` when blocked.
 - SQLite catalog is committed before Qdrant rebuild, so explicit path/symbol lookup can work while vectors are still building.
 - Existing Qdrant collections are updated in place during rebuild; they are not dropped first, so the previous semantic index remains queryable until fresh points replace it.
@@ -170,6 +172,14 @@ First-class glossary/entity sources:
 - `docs/**/standard-definitions.md`
 
 The index cache lives under `.rag/` and should not be committed.
+
+Code-aware indexing is intentionally lightweight:
+
+- all configured text source files are inventoried in SQLite;
+- file lines are indexed for exact/FTS lookup with secret-like values redacted;
+- class/function/controller symbols and config/env keys are extracted;
+- full source files are not embedded into Qdrant by default;
+- docs, glossaries, and runbooks remain the primary semantic retrieval target.
 
 ## Troubleshooting
 

@@ -8,6 +8,7 @@ from typing import Any
 from .catalog import Catalog
 from .config import LocatorConfig
 from .model import SearchResult
+from .source_index import split_camel
 from .vector import VectorIndex
 from .local_bge_backend import BgeM3LocalBackend
 
@@ -75,6 +76,7 @@ class Retriever:
         self.merge_candidates(candidates, dense_results, "vector")
         generators = [
             ("entity", self.entity_candidates(query, repo_area, include_historical)),
+            ("code_bridge", self.code_bridge_candidates(query, repo_area, doc_type, include_historical, mode=mode)),
             ("fts", self.lexical_search(query, repo_area, doc_type, include_historical, int(self.config.data["retrieval"]["candidate_limit_lexical"]), mode=mode)),
             ("alias", self.alias_and_exact_candidates(query, repo_area, include_historical, mode=mode)),
         ]
@@ -83,6 +85,7 @@ class Retriever:
             self.merge_candidates(candidates, generated, generator)
         results = list(candidates.values())
         self.apply_scores(results, query)
+        results.sort(key=lambda r: r.score, reverse=True)
         if rerank:
             rerank_warning = self.try_rerank(query, results)
             if rerank_warning:
@@ -355,6 +358,77 @@ class Retriever:
                 out.append(result)
         return out
 
+    def code_bridge_candidates(self, query: str, repo_area: str | None, doc_type: str | None, include_historical: bool, mode: str = "sections") -> list[SearchResult]:
+        terms = tokenize(query)
+        symbol_terms = [term for term in terms if self.looks_like_symbol(term)]
+        if not symbol_terms:
+            return []
+        status_clause, params = self.allowed_status_clause(include_historical)
+        matched_areas: set[str] = set()
+        bridge_terms: set[str] = set(terms)
+        with self.catalog.connect() as conn:
+            for term in symbol_terms[:6]:
+                rows = conn.execute(
+                    """
+                    SELECT symbol,repo_area,path FROM code_symbols
+                    WHERE lower(symbol)=? OR lower(symbol) LIKE ?
+                    UNION ALL
+                    SELECT key AS symbol,repo_area,path FROM config_keys
+                    WHERE lower(key)=? OR lower(key) LIKE ?
+                    LIMIT 30
+                    """,
+                    (term, f"%{term}%", term, f"%{term}%"),
+                ).fetchall()
+                for row in rows:
+                    area = str(row["repo_area"])
+                    if repo_area and repo_area != "any" and area != repo_area:
+                        continue
+                    matched_areas.add(area)
+                    bridge_terms.update(split_camel(str(row["symbol"])))
+                    bridge_terms.update(tokenize(str(row["path"])))
+            if not matched_areas:
+                return []
+            query_terms = [term for term in bridge_terms if len(term) > 2 and re.match(r"^[A-Za-z0-9_]+$", term)][:12]
+            fts_query = " OR ".join(query_terms) or query
+            area_filter = ""
+            area_params: list[Any] = []
+            if repo_area and repo_area != "any":
+                area_filter = " AND c.repo_area=?"
+                area_params.append(repo_area)
+            else:
+                area_filter = f" AND c.repo_area IN ({','.join('?' for _ in matched_areas)})"
+                area_params.extend(sorted(matched_areas))
+            doc_type_filter = ""
+            doc_type_params: list[Any] = []
+            if doc_type and doc_type != "any":
+                doc_type_filter = " AND c.doc_type=?"
+                doc_type_params.append(doc_type)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT c.*, bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    JOIN chunks c ON c.chunk_id=chunks_fts.chunk_id
+                    WHERE chunks_fts MATCH ? AND {status_clause}{area_filter}{doc_type_filter}
+                    ORDER BY rank, c.authority DESC LIMIT 25
+                    """,
+                    [fts_query, *params, *area_params, *doc_type_params],
+                ).fetchall()
+            except Exception:
+                rows = []
+            out: list[SearchResult] = []
+            for row in rows:
+                lexical = 1.0 / (1.0 + abs(float(row["rank"]))) if "rank" in row.keys() else 0.35
+                title_path = f"{row['title']} {row['path']}".lower()
+                title_boost = 0.12 if any(term in title_path for term in terms if len(term) > 3) else 0.0
+                result = self.row_to_result(row, query, lexical_score=min(1.0, lexical + title_boost), exact_score=0.50 + title_boost, why=["code symbol/config bridge", "repo-area match"])
+                result.source_type = "document"
+                out.append(result)
+            return out
+
+    def looks_like_symbol(self, term: str) -> bool:
+        return bool(re.search(r"[A-Z_./-]", term)) or "_" in term or "/" in term or "." in term or term.lower().endswith(("controller", "handler", "service"))
+
     def row_to_result(self, row: Any, query: str, lexical_score: float = 0.0, exact_score: float = 0.0, why: list[str] | None = None) -> SearchResult:
         return SearchResult(
             path=row["path"],
@@ -592,11 +666,72 @@ class Retriever:
                 add_result({"path": row["path"], "line_number": row["line_number"], "snippet": snippet(row["snippet"], term), "source_kind": row["source_kind"], "related_canonical_docs": []})
             remaining = max_results - len(results)
             if remaining > 0:
-                sym_rows = conn.execute("SELECT * FROM symbols WHERE lower(symbol)=? OR symbol LIKE ? LIMIT ?", (term_text.lower(), q, remaining)).fetchall()
+                file_rows = conn.execute(
+                    """
+                    SELECT path,1 AS line_number,path AS snippet,'source_path' AS source_kind,repo_area,source_repo
+                    FROM source_files
+                    WHERE lower(path)=? OR lower(path) LIKE ?
+                    ORDER BY path LIMIT ?
+                    """,
+                    (term_lower, f"%{term_lower}%", remaining),
+                ).fetchall()
+                for row in file_rows:
+                    if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
+                        continue
+                    if not self.source_path_allowed(conn, row["path"], include_historical):
+                        continue
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": row["snippet"], "source_kind": row["source_kind"], "related_canonical_docs": self.related_docs_for_source(conn, row["path"], row["repo_area"], term_text)})
+            remaining = max_results - len(results)
+            if remaining > 0:
+                sym_rows = conn.execute(
+                    """
+                    SELECT symbol,symbol_type,path,line_number,repo_area,source_repo,source_kind,context
+                    FROM code_symbols
+                    WHERE lower(symbol)=? OR symbol LIKE ?
+                    ORDER BY symbol_type,path LIMIT ?
+                    """,
+                    (term_text.lower(), q, remaining),
+                ).fetchall()
                 for row in sym_rows:
                     if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
                         continue
-                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": row["symbol"], "source_kind": row["source_kind"], "related_canonical_docs": []})
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": row["context"] or row["symbol"], "source_kind": "code_symbol", "related_canonical_docs": self.related_docs_for_source(conn, row["path"], row["repo_area"], term_text)})
+            remaining = max_results - len(results)
+            if remaining > 0:
+                key_rows = conn.execute(
+                    """
+                    SELECT key,key_type,path,line_number,repo_area,source_repo,source_kind,context
+                    FROM config_keys
+                    WHERE lower(key)=? OR key LIKE ?
+                    ORDER BY key_type,path LIMIT ?
+                    """,
+                    (term_text.lower(), q, remaining),
+                ).fetchall()
+                for row in key_rows:
+                    if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
+                        continue
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": row["context"] or row["key"], "source_kind": "config_key", "related_canonical_docs": self.related_docs_for_source(conn, row["path"], row["repo_area"], term_text)})
+            remaining = max_results - len(results)
+            if remaining > 0:
+                fts_query = " OR ".join(tokenize(term_text)) or term_text
+                try:
+                    source_rows = conn.execute(
+                        """
+                        SELECT path,line_number,text AS snippet,source_kind,repo_area,source_repo,bm25(source_lines_fts) AS rank
+                        FROM source_lines_fts
+                        WHERE source_lines_fts MATCH ?
+                        ORDER BY rank LIMIT ?
+                        """,
+                        (fts_query, remaining),
+                    ).fetchall()
+                except Exception:
+                    source_rows = []
+                for row in source_rows:
+                    if repo_area and repo_area != "any" and row["repo_area"] != repo_area:
+                        continue
+                    if not self.source_path_allowed(conn, row["path"], include_historical):
+                        continue
+                    add_result({"path": row["path"], "line_number": row["line_number"], "snippet": snippet(row["snippet"], term), "source_kind": row["source_kind"], "related_canonical_docs": self.related_docs_for_source(conn, row["path"], row["repo_area"], term_text)})
             remaining = max_results - len(results)
             if remaining > 0:
                 entity_rows = conn.execute(
@@ -616,8 +751,37 @@ class Retriever:
                 route_rows = conn.execute("SELECT target_path AS path,topic,route_name,'route' AS source_kind FROM routes WHERE lower(topic)=? OR topic LIKE ? OR target_path LIKE ? ORDER BY priority LIMIT ?", (term_text.lower(), q, q, remaining)).fetchall()
                 for row in route_rows:
                     add_result({"path": row["path"], "line_number": 1, "snippet": row["topic"], "source_kind": row["source_kind"], "related_canonical_docs": [row["path"]]})
-        conf = "high" if results and any(r["source_kind"] in {"catalog_path", "catalog_title"} or term.lower() in str(r["snippet"]).lower() for r in results[:3]) else "medium" if results else "low"
+        conf = "high" if results and any(r["source_kind"] in {"catalog_path", "catalog_title", "source_path", "code_symbol", "config_key"} or term.lower() in str(r["snippet"]).lower() for r in results[:3]) else "medium" if results else "low"
         return {"term": term, "confidence": conf, "results": results[:max_results]}
+
+    def source_path_allowed(self, conn: Any, path: str, include_historical: bool) -> bool:
+        doc = conn.execute("SELECT status FROM documents WHERE path=?", (path,)).fetchone()
+        if not doc:
+            return True
+        excluded = set(self.config.data["policy"]["exclude_by_default"])
+        if not include_historical and self.config.data["policy"].get("historical_requires_flag", True):
+            excluded.add("historical")
+        return str(doc["status"]) not in excluded
+
+    def related_docs_for_source(self, conn: Any, source_path: str, repo_area: str, term: str, limit: int = 5) -> list[str]:
+        terms = [part for part in tokenize(term) + tokenize(source_path) if len(part) > 2]
+        if not terms:
+            return []
+        like_filters = " OR ".join(["lower(title) LIKE ? OR lower(path) LIKE ? OR lower(text) LIKE ?" for _ in terms[:6]])
+        params: list[Any] = []
+        for value in terms[:6]:
+            params.extend([f"%{value.lower()}%", f"%{value.lower()}%", f"%{value.lower()}%"])
+        rows = conn.execute(
+            f"""
+            SELECT path, MAX(authority) AS authority
+            FROM chunks
+            WHERE repo_area=? AND status IN ('canonical','runbook','active') AND ({like_filters})
+            GROUP BY path
+            ORDER BY authority DESC, path LIMIT ?
+            """,
+            [repo_area, *params, limit],
+        ).fetchall()
+        return [str(row["path"]) for row in rows]
 
     def open_doc(self, path: str, heading: str | None = None, line_start: int | None = None, line_end: int | None = None, max_chars: int = 12000) -> dict[str, Any]:
         normalized = path.replace("\\", "/").lstrip("/")

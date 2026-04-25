@@ -121,6 +121,10 @@ workspace:
   owner: workspace
 
 paths:
+  source_roots:
+    - .
+  source_max_file_bytes: 524288
+  source_line_index_max_bytes: 262144
   docs_roots:
 {chr(10).join(f"    - {item}" for item in docs_roots)}
   code_roots:
@@ -149,6 +153,10 @@ paths:
     - .rag
     - dist
     - build
+    - .next
+    - .turbo
+    - .cache
+    - coverage
     - .work
 
 index:

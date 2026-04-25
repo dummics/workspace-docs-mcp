@@ -5,6 +5,40 @@ workspace:
   owner: workspace
 
 paths:
+  source_roots:
+    - .
+  source_file_extensions:
+    - .asmdef
+    - .cs
+    - .cshtml
+    - .css
+    - .editorconfig
+    - .env
+    - .example
+    - .fs
+    - .fsx
+    - .gitignore
+    - .html
+    - .js
+    - .json
+    - .jsonl
+    - .jsx
+    - .md
+    - .mjs
+    - .props
+    - .ps1
+    - .py
+    - .sh
+    - .sql
+    - .toml
+    - .ts
+    - .tsx
+    - .txt
+    - .xml
+    - .yaml
+    - .yml
+  source_max_file_bytes: 524288
+  source_line_index_max_bytes: 262144
   docs_roots:
     - docs
     - documentation
@@ -48,6 +82,10 @@ paths:
     - Temp
     - dist
     - build
+    - .next
+    - .turbo
+    - .cache
+    - coverage
     - .work
 
 index:
