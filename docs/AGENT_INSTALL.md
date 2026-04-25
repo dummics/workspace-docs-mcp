@@ -59,4 +59,6 @@ After the MCP runtime restarts, test only through MCP tools:
 
 Do not use `rg`, grep, broad directory scans, or manual random reads as a replacement for SemRAGent.
 
+If `search_mode=degraded`, keep using the returned citations and let background indexing recover the semantic layer.
+
 If `search_mode=blocked`, follow `owner_action`.

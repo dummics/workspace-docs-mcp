@@ -53,6 +53,8 @@ class IndexFreshnessService:
         qdrant_ok, qdrant_warning = VectorIndex(self.config).available()
         qdrant_counts = self.qdrant_counts() if qdrant_ok else {}
         changed_files = self.changed_files(last_run.get("git_commit") if last_run else None)
+        max_changed = int(self.config.data.get("auto_index", {}).get("max_changed_files", 20))
+        too_many_changed_files = bool(changed_files and len(changed_files) > max_changed)
 
         if catalog_documents == 0 or catalog_chunks == 0:
             state = "blocked"
@@ -60,20 +62,25 @@ class IndexFreshnessService:
             reasons.append("catalog_missing_or_empty")
             warnings.append("index_missing: run or allow background index build")
         elif not last_run:
-            state = "blocked"
-            safe_to_use = False
+            state = "degraded"
             reasons.append("semantic_index_not_completed")
-            warnings.append("semantic_index_not_completed: catalog/exact is available while Qdrant builds")
+            warnings.append("semantic_index_not_completed: using SQLite catalog while Qdrant builds")
         if not qdrant_ok:
-            state = "blocked"
-            safe_to_use = False
+            if catalog_available_for_exact:
+                state = "degraded"
+            else:
+                state = "blocked"
+                safe_to_use = False
             reasons.append("qdrant_unavailable")
-            warnings.append(qdrant_warning or "qdrant_unavailable")
+            warnings.append((qdrant_warning or "qdrant_unavailable") + "; using catalog/FTS if available")
         elif qdrant_counts.get("chunks", 0) <= 0 or qdrant_counts.get("documents", 0) <= 0:
-            state = "blocked"
-            safe_to_use = False
+            if catalog_available_for_exact:
+                state = "degraded"
+            else:
+                state = "blocked"
+                safe_to_use = False
             reasons.append("qdrant_collections_empty")
-            warnings.append("qdrant_collections_empty: background index build needed")
+            warnings.append("qdrant_collections_empty: using SQLite catalog while background index builds")
 
         if last_run:
             for field, expected in [
@@ -84,13 +91,18 @@ class IndexFreshnessService:
                 ("chunker_version", self.config.chunker_version),
             ]:
                 if str(last_run.get(field)) != str(expected):
-                    state = "blocked"
-                    safe_to_use = False
+                    state = "degraded" if catalog_available_for_exact else "blocked"
+                    safe_to_use = catalog_available_for_exact
                     reasons.append(f"{field}_changed")
-                    warnings.append(f"index_incompatible: {field} changed")
+                    warnings.append(f"index_incompatible: {field} changed; using catalog/FTS until rebuild completes")
 
         if changed_files:
-            if state == "fresh":
+            if too_many_changed_files:
+                state = "blocked"
+                safe_to_use = False
+                reasons.append("too_many_changed_files")
+                warnings.append(f"index_blocked: {len(changed_files)} tracked docs/catalog files changed; rebuild explicitly")
+            elif state == "fresh":
                 state = "usable_stale"
             reasons.append("workspace_docs_changed")
             warnings.append(f"index_stale: {len(changed_files)} tracked docs/catalog files changed since last index")
@@ -117,6 +129,7 @@ class IndexFreshnessService:
             "catalog_chunks": catalog_chunks,
             "catalog_available_for_exact": catalog_available_for_exact,
             "exact_available": catalog_available_for_exact,
+            "semantic_available": bool(qdrant_ok and qdrant_counts.get("chunks", 0) > 0 and qdrant_counts.get("documents", 0) > 0 and not any(reason.endswith("_changed") for reason in reasons)),
             "qdrant_available": qdrant_ok,
             "qdrant_warning": qdrant_warning,
             "qdrant_counts": qdrant_counts,

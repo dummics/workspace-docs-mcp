@@ -43,12 +43,18 @@ def run_doctor(config: LocatorConfig, *, check_models: bool = True) -> dict[str,
         names = {item["name"]: item["points"] for item in qstatus.get("collections", [])}
         for collection in [config.data["index"]["qdrant_collection_docs"], config.data["index"]["qdrant_collection_chunks"]]:
             if collection in names:
-                add("OK", f"{collection} ready: {names[collection]} points")
+                points = int(names[collection] or 0)
+                add("OK" if points > 0 else "WARN", f"{collection} ready: {points} points")
+                if points <= 0:
+                    owner_commands.append("semragent index build")
             else:
-                add("FAIL", f"{collection} missing")
+                add("WARN" if int(stats.get("documents", 0) or 0) > 0 else "FAIL", f"{collection} missing")
                 owner_commands.append("semragent index build")
     else:
-        add("FAIL", f"Qdrant unreachable: {qstatus.get('error')}")
+        if int(stats.get("documents", 0) or 0) > 0 and int(stats.get("chunks", 0) or 0) > 0:
+            add("WARN", f"Qdrant unreachable; catalog/FTS remains usable: {qstatus.get('error')}")
+        else:
+            add("FAIL", f"Qdrant unreachable: {qstatus.get('error')}")
         owner_commands.append("semragent qdrant start")
 
     freshness = IndexFreshnessService(config).status(allow_auto_start=False)
@@ -56,6 +62,9 @@ def run_doctor(config: LocatorConfig, *, check_models: bool = True) -> dict[str,
         add("OK", "index compatibility fresh")
     elif freshness.get("state") == "usable_stale":
         add("WARN", "index is usable but stale")
+    elif freshness.get("state") == "degraded":
+        add("WARN", f"semantic index degraded but catalog is usable: {', '.join(freshness.get('reasons', []))}")
+        owner_commands.append("semragent index build")
     else:
         add("FAIL", f"index blocked: {', '.join(freshness.get('reasons', []))}")
         owner_commands.append("semragent index build")

@@ -223,10 +223,11 @@ Add this short policy to the target agent instructions:
 - Use `find_docs` / `locate_topic` before reading files.
 - Use `open_doc` only for returned citations.
 - Do not use shell search or broad `rg` as fallback when the semantic index is blocked.
-- If `search_mode=blocked`, follow `owner_action`.
+- If `search_mode=degraded`, keep using the returned citations; confidence is capped while SemRAGent refreshes in the background.
+- If `search_mode=blocked`, follow `owner_action`; this should usually mean missing/empty catalog or too many changed docs, not a normal restart.
 - Use `search_exact` only for explicit symbol/path/config-key lookups.
 - If `index_status.exact_available=true`, exact lookup is allowed only for those explicit terms; otherwise retry `find_docs` / `locate_topic` after `retry_after_seconds`.
-- If the index is `usable_stale`, the MCP should still answer from the previous index, cap confidence at medium, and refresh in the background after the current search.
+- If the index is `usable_stale` or `degraded`, the MCP should still answer from the catalog/previous index, cap confidence at medium, and refresh in the background after the current search when possible.
 
 This is the intended usage pattern for agents:
 
@@ -291,13 +292,14 @@ Common blockers:
 - The BGE models are not downloaded or cannot load.
 - CUDA PyTorch is missing or CPU-only.
 - The catalog is empty because docs roots are wrong.
-- The index is incompatible after model/backend/config changes.
+- Too many tracked docs/catalog files changed for the old index to be safe.
+- The semantic index is incompatible after model/backend/config changes.
 
 When MCP search is blocked, the response includes `owner_action`. Agents should not invent fallback behavior.
 
-During first indexing, `find_docs` and `locate_topic` can remain blocked until Qdrant document and section collections are complete. After a usable index exists, stale indexes should stay queryable: the MCP answers from the previous index, caps confidence at medium, and updates Qdrant in place in the background. The SQLite catalog is committed first; if `index_status.exact_available=true`, `search_exact` may resolve explicit paths, symbols, route IDs, or config keys while semantic retrieval finishes.
+During first indexing or after a restart, `find_docs`, `locate_topic`, and `prepare_context` should stay usable as long as the SQLite catalog exists. If Qdrant is empty, unavailable, or rebuilding, SemRAGent returns `search_mode=degraded`, caps confidence at medium, uses catalog/FTS/entity/alias signals, and starts background indexing when safe. It returns `search_mode=blocked` only when the catalog is missing/empty or too many tracked docs/catalog files changed for the old index to be trustworthy.
 
-Background indexing is opportunistic, not a daemon. Workers are launched only when the MCP detects a blocked/stale index and auto-indexing is allowed. The worker receives the parent MCP process PID, exits if that parent disappears, and also stops after `auto_index.max_runtime_seconds` (default: `3600`). This prevents an agent session from leaving a long-running BGE/Qdrant process consuming GPU all day.
+Background indexing is opportunistic, not a daemon. Workers are launched only when the MCP detects a stale/degraded index and auto-indexing is allowed. The worker receives the parent MCP process PID, exits if that parent disappears, and also stops after `auto_index.max_runtime_seconds` (default: `3600`). This prevents an agent session from leaving a long-running BGE/Qdrant process consuming GPU all day.
 
 ## Local Model Commands
 

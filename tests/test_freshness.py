@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from workspace_docs_mcp.catalog import Catalog
 from workspace_docs_mcp.config import load_config
 from workspace_docs_mcp.freshness import IndexFreshnessService
 from workspace_docs_mcp.mcp_server import preflight_search
@@ -44,6 +45,43 @@ class IndexFreshnessTests(unittest.TestCase):
 
             self.assertEqual(result["state"], "skipped")
             self.assertEqual(result["reason"], "too_many_changed_files")
+
+    def test_catalog_available_qdrant_empty_is_degraded_not_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            docs = root / "docs"
+            docs.mkdir(parents=True)
+            (docs / "index.md").write_text("# Docs\n\nUseful docs.\n", encoding="utf-8")
+            config = load_config(root)
+            with patch("workspace_docs_mcp.catalog.VectorIndex.rebuild_from_sqlite", return_value={"enabled": False, "reason": "unit-test"}):
+                Catalog(config).rebuild()
+
+            with patch("workspace_docs_mcp.freshness.VectorIndex.available", return_value=(True, None)), patch.object(IndexFreshnessService, "qdrant_counts", return_value={"documents": 0, "chunks": 0}):
+                result = IndexFreshnessService(config).status(allow_auto_start=False)
+
+            self.assertEqual(result["state"], "degraded")
+            self.assertTrue(result["safe_to_use"])
+            self.assertTrue(result["exact_available"])
+            self.assertFalse(result["semantic_available"])
+            self.assertIn("qdrant_collections_empty", result["reasons"])
+
+    def test_too_many_changed_files_blocks_even_with_catalog(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            docs = root / "docs"
+            docs.mkdir(parents=True)
+            (docs / "index.md").write_text("# Docs\n\nUseful docs.\n", encoding="utf-8")
+            config = load_config(root)
+            config.data["auto_index"]["max_changed_files"] = 1
+            with patch("workspace_docs_mcp.catalog.VectorIndex.rebuild_from_sqlite", return_value={"enabled": False, "reason": "unit-test"}):
+                Catalog(config).rebuild()
+
+            with patch("workspace_docs_mcp.freshness.VectorIndex.available", return_value=(True, None)), patch.object(IndexFreshnessService, "qdrant_counts", return_value={"documents": 1, "chunks": 1}), patch.object(IndexFreshnessService, "changed_files", return_value=["docs/a.md", "docs/b.md"]):
+                result = IndexFreshnessService(config).status(allow_auto_start=False)
+
+            self.assertEqual(result["state"], "blocked")
+            self.assertFalse(result["safe_to_use"])
+            self.assertIn("too_many_changed_files", result["reasons"])
 
     def test_preflight_does_not_start_background_for_usable_stale(self) -> None:
         config = load_config(Path.cwd())

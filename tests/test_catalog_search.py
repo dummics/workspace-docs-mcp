@@ -221,9 +221,11 @@ class CatalogSearchTests(unittest.TestCase):
             with patch.object(VectorIndex, "available", return_value=(True, None)), patch.object(IndexFreshnessService, "qdrant_counts", return_value={"documents": 10, "chunks": 0}):
                 status = IndexFreshnessService(config).status(allow_auto_start=False)
 
-            self.assertEqual(status["state"], "blocked")
+            self.assertEqual(status["state"], "degraded")
+            self.assertTrue(status["safe_to_use"])
             self.assertTrue(status["catalog_available_for_exact"])
             self.assertTrue(status["exact_available"])
+            self.assertFalse(status["semantic_available"])
             self.assertIn("semantic_index_not_completed", status["reasons"])
             self.assertEqual(status["indexed_root"], str(root.resolve()))
 
@@ -349,13 +351,38 @@ class CatalogSearchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             self.build_basic_catalog(root)
-            stale = {"state": "usable_stale", "safe_to_use": True, "warnings": ["index_stale"], "reasons": ["workspace_docs_changed"], "background_index": {"state": "skipped", "reason": "unit-test"}}
+            stale = {"state": "usable_stale", "safe_to_use": True, "warnings": ["index_stale"], "reasons": ["workspace_docs_changed"], "background_index": {"state": "skipped", "reason": "unit-test"}, "semantic_available": True, "exact_available": True}
             with patch("workspace_docs_mcp.mcp_server.IndexFreshnessService.status", return_value=stale), patch.object(VectorIndex, "search_documents", return_value=[]):
                 result = call_tool(load_config(root), "find_docs", {"query": "Canonical Activation", "rerank": False})
 
             self.assertLessEqual({"low": 0, "medium": 1, "high": 2}[result["confidence"]], 1)
             self.assertEqual(result["search_mode"], "degraded")
             self.assertIn("index_usable_stale: confidence capped at medium", result["warnings"])
+
+    def test_qdrant_empty_uses_catalog_degraded_instead_of_blocking(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            self.build_basic_catalog(root)
+            config = load_config(root)
+            degraded = {
+                "state": "degraded",
+                "safe_to_use": True,
+                "warnings": ["qdrant_collections_empty: using SQLite catalog while background index builds"],
+                "reasons": ["qdrant_collections_empty"],
+                "background_index": {"state": "started", "retry_after_seconds": 15, "log_path": "x.log"},
+                "exact_available": True,
+                "semantic_available": False,
+            }
+            with patch("workspace_docs_mcp.mcp_server.IndexFreshnessService.status", return_value=degraded), patch.object(VectorIndex, "search_documents", return_value=[]):
+                result = call_tool(config, "find_docs", {"query": "Canonical Activation", "rerank": False})
+
+            self.assertNotEqual(result["search_mode"], "blocked")
+            self.assertEqual(result["search_mode"], "degraded")
+            self.assertTrue(result["results"])
+            self.assertLessEqual({"low": 0, "medium": 1, "high": 2}[result["confidence"]], 1)
+            self.assertFalse(result["semantic_available"])
+            self.assertTrue(result["exact_available"])
+            self.assertIn("background_index_started", result["warnings"])
 
     def test_prepare_context_schema_and_results(self) -> None:
         tool_names = [tool["name"] for tool in tool_schema()]
@@ -385,6 +412,27 @@ class CatalogSearchTests(unittest.TestCase):
             self.assertEqual(result["search_mode"], "blocked")
             self.assertEqual(result["read_first"], [])
             self.assertFalse(result["owner_action"]["safe_for_agent"])
+
+    def test_prepare_context_degraded_mode_returns_read_targets(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            self.build_basic_catalog(root)
+            degraded = {
+                "state": "degraded",
+                "safe_to_use": True,
+                "warnings": ["qdrant_collections_empty"],
+                "reasons": ["qdrant_collections_empty"],
+                "background_index": {"state": "skipped", "reason": "unit-test"},
+                "exact_available": True,
+                "semantic_available": False,
+            }
+            with patch("workspace_docs_mcp.mcp_server.IndexFreshnessService.status", return_value=degraded), patch.object(VectorIndex, "search_documents", return_value=[]), patch.object(VectorIndex, "search_chunks", return_value=[]), patch.object(Retriever, "try_rerank", return_value=None):
+                result = call_tool(load_config(root), "prepare_context", {"task": "Update activation docs", "max_docs": 3, "max_sections": 3})
+
+            self.assertEqual(result["search_mode"], "degraded")
+            self.assertTrue(result["read_first"])
+            self.assertLessEqual({"low": 0, "medium": 1, "high": 2}[result["confidence"]], 1)
+            self.assertFalse(result["index_status"]["semantic_available"])
 
 
 if __name__ == "__main__":

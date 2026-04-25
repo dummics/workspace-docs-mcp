@@ -33,7 +33,7 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
         if preflight:
             return preflight
         index_status = IndexFreshnessService(config).status(allow_auto_start=False)
-        confidence_cap = "medium" if index_status.get("state") == "usable_stale" else None
+        confidence_cap = "medium" if index_status.get("state") in {"usable_stale", "degraded"} else None
         result = retriever.search(args["query"], args.get("repo_area"), args.get("doc_type"), bool(args.get("include_historical", False)), int(args.get("max_results", 8)), bool(args.get("rerank", True)), verbosity=str(args.get("verbosity", "compact")), mode="documents", confidence_cap=confidence_cap)
         index_status = maybe_start_after_search(config, index_status)
         return attach_index_status(config, result, index_status)
@@ -42,7 +42,7 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
         if preflight:
             return preflight
         index_status = IndexFreshnessService(config).status(allow_auto_start=False)
-        confidence_cap = "medium" if index_status.get("state") == "usable_stale" else None
+        confidence_cap = "medium" if index_status.get("state") in {"usable_stale", "degraded"} else None
         result = retriever.search(args["query"], args.get("repo_area"), None, bool(args.get("include_historical", False)), int(args.get("max_sections", 8)), bool(args.get("rerank", True)), dedupe_documents=False, verbosity=str(args.get("verbosity", "compact")), mode="sections", confidence_cap=confidence_cap)
         index_status = maybe_start_after_search(config, index_status)
         return attach_index_status(config, result, index_status)
@@ -75,7 +75,7 @@ def call_tool(config_or_context: LocatorConfig | RuntimeContext, name: str, args
             "index_status": compact_index_status(index_status),
             "qdrant_available": qdrant_ok,
             "qdrant_warning": qdrant_warning,
-            "owner_action": owner_action(index_status) if index_status.get("state") == "blocked" else None,
+            "owner_action": owner_action(index_status) if index_status.get("state") in {"blocked", "degraded"} else None,
             "embedding_model": config.embedding_model,
             "embedding_backend": config.embedding_backend,
             "embedding_dim": config.data["models"].get("require_embedding_dimension"),
@@ -110,7 +110,7 @@ def preflight_search(config: LocatorConfig, query: str) -> dict[str, Any] | None
 
 
 def maybe_start_after_search(config: LocatorConfig, index_status: dict[str, Any]) -> dict[str, Any]:
-    if index_status.get("state") != "usable_stale":
+    if index_status.get("state") not in {"usable_stale", "degraded"}:
         return index_status
     return IndexFreshnessService(config).status(allow_auto_start=True)
 
@@ -153,11 +153,12 @@ def attach_index_status(config: LocatorConfig, result: dict[str, Any], index_sta
         result["warnings"].append("background_index_running")
     elif background.get("state") == "skipped" and background.get("reason") not in {"debounce"}:
         result["warnings"].append(f"background_index_skipped:{background.get('reason')}")
-    if index_status.get("state") == "usable_stale":
+    if index_status.get("state") in {"usable_stale", "degraded"}:
         result["search_mode"] = "degraded"
         result["exact_available"] = bool(index_status.get("exact_available"))
-        result["hybrid_available"] = True
-        result["warnings"].append("index_usable_stale: confidence capped at medium")
+        result["semantic_available"] = bool(index_status.get("semantic_available"))
+        result["hybrid_available"] = bool(index_status.get("semantic_available"))
+        result["warnings"].append(f"index_{index_status.get('state')}: confidence capped at medium")
     return result
 
 
@@ -166,10 +167,13 @@ def prepare_context(config: LocatorConfig, retriever: Retriever, args: dict[str,
     preflight = preflight_search(config, task)
     if preflight:
         return {"task": task, "search_mode": "blocked", "confidence": "low", "read_first": [], "related_sections": [], "related_symbols": [], "do_not_start_with": [], "warnings": preflight["warnings"], "owner_action": preflight["owner_action"], "index_status": preflight["index_status"]}
+    index_status = IndexFreshnessService(config).status(allow_auto_start=False)
+    confidence_cap = "medium" if index_status.get("state") in {"usable_stale", "degraded"} else None
     include_historical = bool(args.get("include_historical", False))
     repo_area = args.get("repo_area")
-    docs = retriever.search(task, repo_area=repo_area, include_historical=include_historical, max_results=int(args.get("max_docs", 5)), rerank=True, mode="documents")
-    sections = retriever.search(task, repo_area=repo_area, include_historical=include_historical, max_results=int(args.get("max_sections", 8)), rerank=True, mode="sections", dedupe_documents=False)
+    docs = retriever.search(task, repo_area=repo_area, include_historical=include_historical, max_results=int(args.get("max_docs", 5)), rerank=True, mode="documents", confidence_cap=confidence_cap)
+    sections = retriever.search(task, repo_area=repo_area, include_historical=include_historical, max_results=int(args.get("max_sections", 8)), rerank=True, mode="sections", dedupe_documents=False, confidence_cap=confidence_cap)
+    index_status = maybe_start_after_search(config, index_status)
     symbols: list[dict[str, Any]] = []
     max_symbols = int(args.get("max_symbols", 10))
     if max_symbols:
@@ -192,13 +196,14 @@ def prepare_context(config: LocatorConfig, retriever: Retriever, args: dict[str,
     return {
         "task": task,
         "confidence": docs.get("confidence", "low"),
-        "search_mode": docs.get("search_mode", "normal"),
+        "search_mode": "degraded" if index_status.get("state") in {"usable_stale", "degraded"} else docs.get("search_mode", "normal"),
         "read_first": read_first,
         "related_sections": related_sections,
         "related_symbols": symbols,
         "do_not_start_with": [],
-        "warnings": list(dict.fromkeys([*docs.get("warnings", []), *sections.get("warnings", [])])),
+        "warnings": list(dict.fromkeys([*docs.get("warnings", []), *sections.get("warnings", []), *index_status.get("warnings", [])])),
         "owner_action": None,
+        "index_status": compact_index_status(index_status),
     }
 
 
@@ -234,6 +239,7 @@ def compact_index_status(status: dict[str, Any]) -> dict[str, Any]:
         "changed_files_count": status.get("changed_files_count", 0),
         "catalog_available_for_exact": bool(status.get("catalog_available_for_exact")),
         "exact_available": bool(status.get("exact_available")),
+        "semantic_available": bool(status.get("semantic_available")),
         "qdrant_counts": status.get("qdrant_counts", {}),
         "background_index": {
             "state": (status.get("background_index") or {}).get("state"),

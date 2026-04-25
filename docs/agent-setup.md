@@ -32,7 +32,7 @@ Validation:
 - Call open_doc only on citations returned by the locator.
 
 Success criteria:
-- index_status is fresh or usable_stale with safe_to_use=true.
+- index_status is fresh, usable_stale, or degraded with safe_to_use=true.
 - find_docs/locate_topic return cited results.
 - search_exact resolves explicit symbols/paths/config keys without exposing secret values.
 - No broad shell search is used as fallback.
