@@ -1,0 +1,7 @@
+[mcp_servers.workspaceDocs]
+command = "workspace-docs-mcp"
+args = ["--root", "C:\\path\\to\\workspace"]
+enabled = true
+startup_timeout_sec = 120
+tool_timeout_sec = 300
+

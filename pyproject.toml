@@ -1,9 +1,27 @@
 [project]
-name = "workspace-docs-locator"
+name = "workspace-docs-mcp"
 version = "0.1.0"
-description = "Local MCP Doc Locator for project workspaces"
+description = "Local-first read-only MCP server for finding authoritative workspace docs"
 requires-python = ">=3.11"
-dependencies = []
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "dummics" }
+]
+keywords = ["mcp", "documentation", "retrieval", "qdrant", "bge-m3", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Documentation",
+  "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+  "PyYAML>=6.0.2"
+]
 
 [project.optional-dependencies]
 vector = [
@@ -20,9 +38,31 @@ yaml = [
 mcp = [
   "mcp>=1.2.0"
 ]
+dev = [
+  "build>=1.2.2",
+  "pytest>=8.3.0",
+  "qdrant-client>=1.12.0"
+]
+all = [
+  "qdrant-client>=1.12.0",
+  "FlagEmbedding>=1.4.0",
+  "torch>=2.6",
+  "pyarrow>=21,<24",
+  "PyYAML>=6.0.2",
+  "mcp>=1.2.0"
+]
 
 [project.scripts]
 workspace-docs = "workspace_docs_mcp.cli:main"
+workspace-docs-mcp = "workspace_docs_mcp.cli:mcp_main"
+
+[project.urls]
+Homepage = "https://github.com/dummics/workspace-docs-mcp"
+Repository = "https://github.com/dummics/workspace-docs-mcp"
+Issues = "https://github.com/dummics/workspace-docs-mcp/issues"
+
+[tool.setuptools.packages.find]
+include = ["workspace_docs_mcp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

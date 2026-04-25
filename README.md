@@ -1,74 +1,165 @@
----
-title: Workspace Docs MCP
-status: active
----
-
 # Workspace Docs MCP
 
-Generic local, read-only MCP server for locating authoritative documentation in a project workspace.
+Local-first, read-only MCP server for helping coding agents find the right documentation faster than manual `rg`/grep spelunking.
 
-It is not a chat RAG system. Its job is narrower:
+It is intentionally not a generative RAG chat app. It locates authoritative docs, sections, definitions, and citations inside a workspace.
 
-> Given a query, topic, symbol, or path, return the right document/section with citation, status, confidence, ranking signals, and a short explanation.
+Given a query such as `where is the auth runbook?`, `definition of extractor`, or `PaymentWebhookHandler`, the MCP returns:
 
-## Principles
+- workspace-relative path;
+- title, status, type, and area;
+- heading and line range;
+- citation;
+- confidence;
+- compact ranking signals;
+- warning/owner action when the index needs attention.
 
-- Git + Markdown + project manifests are the source of truth.
-- SQLite is the deterministic catalog.
-- Qdrant is a rebuildable vector/sparse cache.
-- Embeddings are local `BAAI/bge-m3` via `FlagEmbedding.BGEM3FlagModel`.
-- Reranking is local `BAAI/bge-reranker-v2-m3` via `FlagEmbedding.FlagReranker`.
+## Why
+
+Agents often waste tokens and time reading random files or running broad text search. This tool gives them a simple pattern:
+
+1. Ask `find_docs` or `locate_topic`.
+2. Open only the returned citation with `open_doc`.
+3. Escalate to the owner if the semantic index is blocked.
+
+`search_exact` exists for explicit symbols/paths/config keys, but it is not a fallback when semantic search is blocked.
+
+## Features
+
+- Read-only MCP tools.
+- SQLite catalog for deterministic inspection.
+- Qdrant vector/sparse cache.
+- Local `BAAI/bge-m3` embeddings through `FlagEmbedding.BGEM3FlagModel`.
+- Local `BAAI/bge-reranker-v2-m3` reranker through `FlagEmbedding.FlagReranker`.
 - No fallback to alternate models.
-- MCP tools are read-only.
-- Agents should use semantic search first: `find_docs` / `locate_topic` -> `open_doc`.
-- Search preflights index freshness. A blocked semantic index returns a clear owner action instead of silently falling back.
-- Glossaries and domain definition files are first-class retrieval sources for definition/naming/domain-model queries.
+- Document-first search for `find_docs`.
+- Section-first search for `locate_topic`.
+- Glossary/entity retrieval for definitions and naming/domain-model queries.
+- Background indexing hints with explicit `owner_action` when blocked.
+- Compact JSON output with scores rounded to `0.000..1.000`.
+- Windows-friendly scripts plus normal Python entrypoints.
 
-## MCP Tools
+## Requirements
 
-- `find_docs`: document-first semantic locator using document cards first.
-- `locate_topic`: section-first semantic locator.
-- `open_doc`: open a returned catalog-known citation/path with traversal blocking and bounded content.
-- `search_exact`: exact lookup for explicit symbols, paths, config keys, route IDs, or manifest names only.
-- `list_canonical`: list canonical/runbook docs by area/topic.
-- `doc_neighbors`: links and related docs.
-- `explain_result`: explain ranking for a query/path.
-- `index_status`: compact readiness report.
+- Python 3.11 or newer.
+- Git.
+- Qdrant running locally on `http://localhost:6333`.
+- Local model access/cache for:
+  - `BAAI/bge-m3`
+  - `BAAI/bge-reranker-v2-m3`
+- Optional but recommended: NVIDIA GPU with CUDA PyTorch for practical performance.
 
-Default search output is compact and token-efficient. Scores are normalized `0..1` with three decimals, for example `0.756`.
-Use `verbosity=full` or `explain_result` for debugging.
+## Install
 
-## Install From Source
+From source:
 
 ```powershell
-cd "$env:USERPROFILE\.scriptsdum\workspace-docs-mcp"
-python -m pip install -e .[vector,models,yaml]
+git clone https://github.com/dummics/workspace-docs-mcp.git
+cd workspace-docs-mcp
+python -m pip install -e ".[all]"
 ```
 
-For NVIDIA CUDA on Windows, install a CUDA PyTorch wheel before running model checks:
+CUDA PyTorch on Windows, before model checks:
 
 ```powershell
 python -m pip install --user --force-reinstall "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
-python -m pip install --user "numpy==1.26.4" "setuptools>=80.9.0" "pillow>=10.3,<11"
 ```
 
-## Project Configuration
-
-Create `.workspace-docs/locator.config.yml` in the target workspace.
-
-Start from:
+Lean install for CI or catalog-only development:
 
 ```powershell
-Copy-Item "$env:USERPROFILE\.scriptsdum\workspace-docs-mcp\catalog\locator.config.yml" ".workspace-docs\locator.config.yml"
+python -m pip install -e ".[dev]"
 ```
 
-Optional project files:
+## Quick Start
 
-- `.workspace-docs/topic-aliases.json`
-- `.workspace-docs/eval-canonical-topics.json`
-- `.workspace-docs/canonical-map.yml`
+Inside the workspace you want agents to search:
 
-First-class glossary/entity sources when present:
+```powershell
+workspace-docs init --preset generic
+docker run -p 6333:6333 -v ${PWD}/.rag/qdrant:/qdrant/storage qdrant/qdrant
+workspace-docs models doctor
+workspace-docs index build
+workspace-docs search "where is the architecture overview?"
+workspace-docs mcp
+```
+
+Without installing, from a source checkout:
+
+```powershell
+$tool = "C:\path\to\workspace-docs-mcp"
+$env:PYTHONPATH = $tool
+python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" init
+python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" models doctor
+python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" index build
+python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" mcp
+```
+
+## MCP Tools
+
+- `find_docs`: document-first locator for "where is the doc for X?"
+- `locate_topic`: section-first locator for heading-level citations.
+- `open_doc`: opens a catalog-known path/heading/line range, with traversal blocking and `max_chars`.
+- `search_exact`: exact lookup for explicit symbols, paths, config keys, route IDs, and manifest names.
+- `list_canonical`: lists canonical/runbook docs by area/topic.
+- `doc_neighbors`: returns links and related docs for one path.
+- `explain_result`: explains ranking or no-results; `path` may be null.
+- `index_status`: read-only readiness report.
+
+## MCP Config
+
+### Codex
+
+See [prompts/codex-config.example.toml](prompts/codex-config.example.toml).
+
+```toml
+[mcp_servers.workspaceDocs]
+command = "workspace-docs-mcp"
+args = ["--root", "C:\\path\\to\\workspace"]
+enabled = true
+startup_timeout_sec = 120
+tool_timeout_sec = 300
+```
+
+### Claude Desktop
+
+See [prompts/claude-desktop-config.example.json](prompts/claude-desktop-config.example.json).
+
+```json
+{
+  "mcpServers": {
+    "workspace-docs": {
+      "command": "workspace-docs-mcp",
+      "args": ["--root", "C:\\path\\to\\workspace"]
+    }
+  }
+}
+```
+
+## Agent Instructions
+
+Add [prompts/AGENTS.addendum.md](prompts/AGENTS.addendum.md) to the target workspace or paste it into your agent instructions.
+
+Short version:
+
+- Use `find_docs` / `locate_topic` before reading files.
+- Use `open_doc` only for returned citations.
+- Do not use shell search or broad `rg` as fallback when the semantic index is blocked.
+- If `search_mode=blocked`, follow `owner_action`.
+- Use `search_exact` only for explicit symbol/path/config-key lookups.
+
+## Project Config
+
+`workspace-docs init` creates:
+
+```text
+.workspace-docs/
+  locator.config.yml
+  topic-aliases.json
+  eval-canonical-topics.json
+```
+
+First-class glossary/entity sources:
 
 - `domain-definitions.json`
 - `glossary.yml`
@@ -76,69 +167,53 @@ First-class glossary/entity sources when present:
 - `docs/**/terms.md`
 - `docs/**/standard-definitions.md`
 
-The `examples/licensing-framework/` folder contains the real adapter that motivated the tool.
+The index cache lives under `.rag/` and should not be committed.
 
-## Qdrant
+## Troubleshooting
 
-```powershell
-docker run -p 6333:6333 -v ${PWD}/.rag/qdrant:/qdrant/storage qdrant/qdrant
-```
-
-## CLI
-
-From the target workspace:
+Run:
 
 ```powershell
 workspace-docs models doctor
-workspace-docs index build
-workspace-docs search "where is the API authentication runbook?"
-workspace-docs mcp
+workspace-docs index_status
 ```
 
-Or from the source checkout without installing:
+Common blockers:
+
+- Qdrant is not running.
+- The BGE models are not downloaded or cannot load.
+- CUDA PyTorch is missing or CPU-only.
+- The catalog is empty because docs roots are wrong.
+- The index is incompatible after model/backend/config changes.
+
+When MCP search is blocked, the response includes `owner_action`. Agents should not invent fallback behavior.
+
+## Security Model
+
+- MCP tools are read-only.
+- No arbitrary shell execution through MCP.
+- `open_doc` only opens catalog-known workspace-relative files.
+- Path traversal is blocked with `Path.relative_to`.
+- Qdrant and SQLite are rebuildable caches, not source of truth.
+
+## Examples
+
+The [examples/licensing-framework](examples/licensing-framework) folder is a real project adapter/fixture. It is not part of the core product boundary.
+
+## Development
 
 ```powershell
-$tool = "$env:USERPROFILE\.scriptsdum\workspace-docs-mcp"
-$env:PYTHONPATH = $tool
-python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" models doctor
-python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" index build
-python -m workspace_docs_mcp.cli --root "C:\path\to\workspace" mcp
+python -m pip install -e ".[dev]"
+python -m unittest discover -s tests -v
+python -m build
 ```
 
-## MCP Config
+Model/Qdrant smoke:
 
-Example Codex config:
-
-```toml
-[mcp_servers.workspaceDocs]
-command = "cmd"
-args = ["/c", "C:\\Users\\domix\\.scriptsdum\\workspace-docs-mcp\\bin\\workspace-docs-mcp.cmd", "-Root", "C:\\path\\to\\workspace"]
-enabled = true
-startup_timeout_sec = 120
-tool_timeout_sec = 300
+```powershell
+workspace-docs models doctor
 ```
 
-Expected server name: `workspace-docs-mcp`.
+## License
 
-## Agent Pattern
-
-Normal flow:
-
-1. Call `find_docs` for "where is the doc for X?"
-2. Call `locate_topic` when a section-level citation is better.
-3. Call `open_doc` only for a returned citation/path.
-
-Do not use `search_exact`, shell search, or manual generated-index reading as fallback after semantic search fails, is stale, or is blocked.
-If `index_status.state` is `blocked` and `background_index_started/running`, wait briefly and retry the same semantic search.
-If it remains blocked, report the blocker to the owner/operator.
-If `index_status.state` is `usable_stale`, search can continue but confidence is capped at `medium`.
-
-## GPT Pro Review Package
-
-This repo includes:
-
-- `docs/gpt-pro-review-brief.md`
-- `docs/mvp-improvement-backlog.md`
-- `examples/licensing-framework/`
-
-Use these for external review of the MVP architecture and next improvements.
+MIT. See [LICENSE](LICENSE).

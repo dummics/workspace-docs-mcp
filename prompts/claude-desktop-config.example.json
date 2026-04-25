@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "workspace-docs": {
+      "command": "workspace-docs-mcp",
+      "args": ["--root", "C:\\path\\to\\workspace"]
+    }
+  }
+}
+
