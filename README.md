@@ -38,6 +38,7 @@ Agents often waste tokens and time reading random files or running broad text se
 - Workspace file inventory plus lightweight code/config exact index.
 - Code symbols and config keys can bridge queries back to authoritative docs without embedding full source files.
 - Background indexing hints with explicit `owner_action` when blocked.
+- Background index workers are parent-bound and have a runtime cap, so they do not keep GPU/CPU busy indefinitely after the agent runtime exits.
 - SQLite catalog is committed before Qdrant rebuild, so explicit path/symbol lookup can work while vectors are still building.
 - Existing Qdrant collections are updated in place during rebuild; they are not dropped first, so the previous semantic index remains queryable until fresh points replace it.
 - Compact JSON output with scores rounded to `0.000..1.000`.
@@ -250,6 +251,8 @@ Common blockers:
 When MCP search is blocked, the response includes `owner_action`. Agents should not invent fallback behavior.
 
 During first indexing, `find_docs` and `locate_topic` can remain blocked until Qdrant document and section collections are complete. After a usable index exists, stale indexes should stay queryable: the MCP answers from the previous index, caps confidence at medium, and updates Qdrant in place in the background. The SQLite catalog is committed first; if `index_status.exact_available=true`, `search_exact` may resolve explicit paths, symbols, route IDs, or config keys while semantic retrieval finishes.
+
+Background indexing is opportunistic, not a daemon. Workers are launched only when the MCP detects a blocked/stale index and auto-indexing is allowed. The worker receives the parent MCP process PID, exits if that parent disappears, and also stops after `auto_index.max_runtime_seconds` (default: `3600`). This prevents an agent session from leaving a long-running BGE/Qdrant process consuming GPU all day.
 
 ## Security Model
 

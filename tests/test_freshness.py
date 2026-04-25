@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from workspace_docs_mcp.config import load_config
 from workspace_docs_mcp.freshness import IndexFreshnessService
@@ -53,6 +54,29 @@ class IndexFreshnessTests(unittest.TestCase):
 
         self.assertIsNone(result)
         status.assert_called_once_with(allow_auto_start=False)
+
+    def test_background_worker_is_parent_bound(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            config = load_config(root)
+            config.data["auto_index"]["max_runtime_seconds"] = 123
+            config.data["auto_index"]["orphan_check_seconds"] = 2
+            process = Mock()
+            process.pid = 4242
+
+            with patch("workspace_docs_mcp.freshness.subprocess.Popen", return_value=process) as popen:
+                result = IndexFreshnessService(config).start_background_index("usable_stale", ["docs/a.md"])
+
+            self.assertEqual(result["state"], "started")
+            command = popen.call_args.args[0]
+            self.assertIn("--parent-pid", command)
+            self.assertIn("--max-runtime-seconds", command)
+            self.assertIn("123", command)
+            self.assertIn("--orphan-check-seconds", command)
+            self.assertIn("2", command)
+            lock = json.loads((root / ".rag" / "index.lock").read_text(encoding="utf-8"))
+            self.assertEqual(lock["pid"], 4242)
+            self.assertIn("parent_pid", lock)
 
 
 if __name__ == "__main__":

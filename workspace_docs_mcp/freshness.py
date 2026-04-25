@@ -175,6 +175,7 @@ class IndexFreshnessService:
             return ""
 
     def background_state(self) -> dict[str, Any]:
+        self.prune_stale_lock()
         state: dict[str, Any] = {"state": "idle", "lock_path": str(self.lock_path), "log_path": str(self.log_path)}
         if self.lock_path.exists():
             state["state"] = "running"
@@ -194,6 +195,28 @@ class IndexFreshnessService:
             except Exception:
                 pass
         return state
+
+    def prune_stale_lock(self) -> None:
+        if not self.lock_path.exists():
+            return
+        try:
+            lock = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        auto = self.config.data.get("auto_index", {})
+        started = parse_time(lock.get("started_at"))
+        elapsed = (utc_now() - started).total_seconds() if started else 0
+        worker_pid = lock.get("pid")
+        parent_pid = lock.get("parent_pid")
+        stale_after = int(auto.get("stale_lock_seconds", 7200))
+        parent_gone = bool(lock.get("terminate_with_parent", True) and parent_pid and not process_alive(int(parent_pid)))
+        worker_gone = bool(worker_pid and not process_alive(int(worker_pid)))
+        too_old = bool(elapsed and elapsed > stale_after)
+        if parent_gone or worker_gone or too_old:
+            try:
+                self.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def maybe_start_background_index(self, index_state: str, changed_files: list[str], qdrant_ok: bool) -> dict[str, Any]:
         auto = self.config.data.get("auto_index", {})
@@ -223,10 +246,20 @@ class IndexFreshnessService:
 
     def start_background_index(self, index_state: str, changed_files: list[str]) -> dict[str, Any]:
         started = utc_now().isoformat()
+        auto = self.config.data.get("auto_index", {})
+        terminate_with_parent = bool(auto.get("terminate_with_parent", True))
+        parent_pid = os.getpid() if terminate_with_parent else None
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.last_start_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"started_at": started, "reason": index_state, "changed_files_count": len(changed_files)}
+        payload = {
+            "started_at": started,
+            "reason": index_state,
+            "changed_files_count": len(changed_files),
+            "parent_pid": parent_pid,
+            "terminate_with_parent": terminate_with_parent,
+            "max_runtime_seconds": int(auto.get("max_runtime_seconds", 3600)),
+        }
         self.lock_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.last_start_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -239,7 +272,13 @@ class IndexFreshnessService:
             str(self.config.root),
             "--lock",
             str(self.lock_path),
+            "--orphan-check-seconds",
+            str(int(auto.get("orphan_check_seconds", 5))),
+            "--max-runtime-seconds",
+            str(int(auto.get("max_runtime_seconds", 3600))),
         ]
+        if parent_pid:
+            command.extend(["--parent-pid", str(parent_pid)])
         log = self.log_path.open("a", encoding="utf-8")
         creationflags = 0
         if os.name == "nt":
@@ -266,4 +305,30 @@ class IndexFreshnessService:
             except Exception:
                 pass
             return {"state": "failed_to_start", "error": str(exc)}
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+            return bool(ok and exit_code.value == 259)  # STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
